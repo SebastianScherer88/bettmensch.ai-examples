@@ -206,52 +206,7 @@ def generate_padded_subsequent_mask(
     return final_mask
 
 
-def attention(
-    queries: Float[torch.Tensor, "n_batch n_queries dim_query_key"],
-    keys: Float[torch.Tensor, "n_batch n_keys_values dim_query_key"],
-    values: Float[torch.Tensor, "n_batch n_keys_values dim_value"],
-    mask: Optional[Float[torch.Tensor, "n_batch n_queries n_keys_values"]],
-) -> Float[torch.Tensor, "n_batch n_query dim_value"]:
-    """Single head attention function.
-
-    Projections of the multihead attention block need to be done before/after
-
-    Example:
-    q = Tensor([[[1,2],[3,4]]])
-    k = Tensor([[[1,2],[3,4]]])
-    v = Tensor([[[1,2,3],[4,5,6]]])
-
-    attention(q,k,v)
-    # tensor([[[3.9089, 4.9089, 5.9089],
-    #      [3.9991, 4.9991, 5.9991]]])
-    """
-    # get dimension of value space for normalization purposes
-    dim_value = torch.tensor(values.shape[-1])
-
-    coefficients: Float[
-        torch.Tensor, "n_batch n_queries n_keys_values"
-    ] = torch.matmul(queries, keys.transpose(-2, -1)) / torch.sqrt(dim_value)
-
-    # set invalid coefficients to -inf, so that they become ~0 convex
-    # coefficients after the application of the softmax
-    masked_coefficients = coefficients.masked_fill(
-        mask == False, float('-inf')  # noqa: E712
-    )
-
-    # convert pseudo coefficients into convex combination coefficients
-    convex_coefficients: Float[
-        torch.Tensor, "n_batch n_queries n_keys_values"
-    ] = torch.softmax(masked_coefficients, dim=-1)
-
-    # calculate attention tensor
-    att: Float[torch.Tensor, "n_batch n_queries n_keys_values"] = torch.matmul(
-        convex_coefficients, values
-    )
-
-    return att
-
-
-class MultiHeadedSelfAttentionKarpathy(VerboseIOModule):
+class MultiHeadedSelfAttention(VerboseIOModule):
     """Implements tensorized attention based on Andrej Karpaty's MinGPT"""
 
     def __init__(
@@ -337,73 +292,6 @@ class MultiHeadedSelfAttentionKarpathy(VerboseIOModule):
 
         return self.dropout_residual(att_proj)
 
-class MultiHeadedAttentionFast(VerboseIOModule):
-    """Implements a multi head attention layer that can be used for cross and
-    or self attention. As described in
-    - https://arxiv.org/pdf/1706.03762 (originally introduced)
-    - https://cdn.openai.com/research-covers/language-unsupervised/...
-        ...language_understanding_paper.pdf (referenced)
-    """
-
-    def __init__(
-        self,
-        n_heads: int = 12,
-        dim_input: int = 768,
-        dropout: float = 0.1,
-        id: str = "MultiHeadAttentionFast",
-    ):
-        super().__init__(id=id)
-
-        assert (
-            dim_input % n_heads == 0
-        ), f"Query & value embedding size {dim_input} is not divisable by "
-        f"attention head count {n_heads}"
-
-        self.n_heads = n_heads
-        self.dim_input = dim_input
-        self.dim_sh_embed = int(dim_input / n_heads)
-
-        # initialize projections for queries, keys and values for all channels
-        self.W_queries = torch.nn.Linear(self.dim_input, self.dim_sh_embed * self.n_heads,dtype=torch.half)
-                
-        self.W_keys = torch.nn.Linear(self.dim_input, self.dim_sh_embed * self.n_heads,dtype=torch.half)
-                
-        self.W_values = torch.nn.Linear(self.dim_input, self.dim_sh_embed * self.n_heads,dtype=torch.half)
-                
-        self.W_out = torch.nn.Linear(self.dim_input, self.dim_input,dtype=torch.half)
-        self.dropout = torch.nn.Dropout(p=dropout)
-
-    @VerboseIOModule.display_io_sizes()
-    def forward(
-        self,
-        x: Float[torch.Tensor, "n_batch n_queries dim_mh_embed"],
-        keys: Float[torch.Tensor, "n_batch n_keys_values dim_mh_embed"],
-        values: Float[torch.Tensor, "n_batch n_keys_values dim_mh_embed"],
-        mask: Optional[Float[torch.Tensor, "n_batch n_queries n_keys_values"]],
-    ) -> Float[torch.Tensor, "n_batch n_queries dim_mh_embed"]:
-        
-        queries = self.W_queries(x)
-        keys = self.W_keys(keys)
-        values = self.W_values(values)
-
-        att_list = []
-
-        for head_index in range(self.n_heads):
-            queries_i = queries[:,:,head_index*self.dim_sh_embed:(head_index+1)*self.dim_sh_embed]
-            keys_i = keys[:,:,head_index*self.dim_sh_embed:(head_index+1)*self.dim_sh_embed]
-            values_i = values[:,:,head_index*self.dim_sh_embed:(head_index+1)*self.dim_sh_embed]
-
-            att_i = attention(
-                queries=queries_i, keys=keys_i, values=values_i, mask=mask
-            )
-            att_list.append(att_i)
-
-        att = torch.concatenate(att_list, -1)
-
-        multi_head_attention = self.dropout(self.W_out(att))
-
-        return multi_head_attention
-
 class FeedForward(VerboseIOModule):
     """The feed forward layer (including dropout) as described in https://...
     ...cdn.openai.com/research-covers/language-unsupervised/...
@@ -457,7 +345,7 @@ class SkipNorm(VerboseIOModule):
 
     def __init__(
         self,
-        skipped_layer: Union[MultiHeadedAttentionFast, FeedForward],
+        skipped_layer: Union[MultiHeadedSelfAttention, FeedForward],
         dropout: float = 0.1,
         id: str = "SkipNorm",
     ):
@@ -492,7 +380,7 @@ class SkipNorm(VerboseIOModule):
         )
 
     
-class DecoderLayerFast(VerboseIOModule):
+class DecoderLayer(VerboseIOModule):
 
     def __init__(
         self,
@@ -503,40 +391,7 @@ class DecoderLayerFast(VerboseIOModule):
     ):
         super().__init__(id=id)
         self.skip_norm_mha = SkipNorm(
-            MultiHeadedAttentionFast(
-                n_heads=n_heads, dim_input=dim_input, dropout=dropout, id="mha"
-            ),
-            id="skip_mha",
-        )
-        self.skip_norm_ff = SkipNorm(
-            FeedForward(dim_input=dim_input, dropout=dropout, id="ff"),
-            id="skip_ff",
-        )
-
-    @VerboseIOModule.display_io_sizes()
-    def forward(
-        self,
-        x: Float[torch.Tensor, "n_batch n_tokens dim_input"],
-        mask: Bool[torch.Tensor, "n_batch n_tokens"],
-    ) -> Float[torch.Tensor, "n_batch n_tokens dim_input"]:
-        mha_mask = generate_padded_subsequent_mask(mask)
-        mha_out = self.skip_norm_mha(x=x, keys=x, values=x, mask=mha_mask)
-        ff_out = self.skip_norm_ff(mha_out)
-
-        return ff_out
-    
-class DecoderLayerKarpathy(VerboseIOModule):
-
-    def __init__(
-        self,
-        n_heads: int = 12,
-        dim_input: int = 768,
-        dropout: float = 0.1,
-        id: str = "DecoderLayer",
-    ):
-        super().__init__(id=id)
-        self.skip_norm_mha = SkipNorm(
-            MultiHeadedSelfAttentionKarpathy(
+            MultiHeadedSelfAttention(
                 n_heads=n_heads, dim_input=dim_input, dropout=dropout, id="mhsa_k"
             ),
             id="skip_mhsa_k",
@@ -557,9 +412,8 @@ class DecoderLayerKarpathy(VerboseIOModule):
         ff_out = self.skip_norm_ff(mha_out)
 
         return ff_out
-    
-
-class DecoderFast(VerboseIOModule):
+        
+class Decoder(VerboseIOModule):
 
     def __init__(
         self,
@@ -573,7 +427,7 @@ class DecoderFast(VerboseIOModule):
 
         self.layers = torch.nn.ModuleList(
             [
-                DecoderLayerFast(
+                DecoderLayer(
                     n_heads=n_heads,
                     dim_input=dim_input,
                     dropout=dropout,
@@ -593,43 +447,8 @@ class DecoderFast(VerboseIOModule):
             x = layer(x, mask)
 
         return x
-    
-class DecoderKarpathy(VerboseIOModule):
-
-    def __init__(
-        self,
-        dim_input: int = 768,
-        n_decoder_layers: int = 12,
-        n_heads: int = 12,
-        dropout: float = 0.1,
-        id: str = "Decoder",
-    ):
-        super().__init__(id=id)
-
-        self.layers = torch.nn.ModuleList(
-            [
-                DecoderLayerKarpathy(
-                    n_heads=n_heads,
-                    dim_input=dim_input,
-                    dropout=dropout,
-                    id=f"DecoderLayer_{i+1}",
-                )
-                for i in range(n_decoder_layers)
-            ]
-        )
-
-    @VerboseIOModule.display_io_sizes()
-    def forward(
-        self,
-        x: Float[torch.Tensor, "n_batch n_tokens dim_input"],
-        mask: Bool[torch.Tensor, "n_batch n_tokens"],
-    ) -> Float[torch.Tensor, "n_batch n_tokens dim_input"]:
-        for layer in self.layers:
-            x = layer(x, mask)
-
-        return x
-    
-class GPT1CoreFast(VerboseIOModule):
+        
+class GPT1Core(VerboseIOModule):
 
     def __init__(
         self,
@@ -648,59 +467,7 @@ class GPT1CoreFast(VerboseIOModule):
             dim_embed=dim_embed,
             dropout=dropout,
         )
-        self.decoder = DecoderFast(
-            dim_input=dim_embed,
-            n_decoder_layers=n_decoder_layers,
-            n_heads=n_heads,
-            dropout=dropout,
-        )
-        self.set_nest_level()
-
-    @VerboseIOModule.display_io_sizes()
-    def forward(
-        self,
-        x: Float[torch.Tensor, "n_batch n_tokens"],
-        mask: Bool[torch.Tensor, "n_batch n_tokens"],
-    ) -> Float[torch.Tensor, "n_batch n_tokens dim_input"]:
-        e = self.embedding(x)
-        d = self.decoder(e, mask)
-
-        return d
-    
-    def _init_weights(self, module):
-        if isinstance(module, torch.nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, torch.nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, torch.nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
-
-    def init_weights(self):
-        self.apply(self._init_weights)
-    
-class GPT1CoreKarpathy(VerboseIOModule):
-
-    def __init__(
-        self,
-        n_vocab: int,
-        n_tokens=512,
-        dim_embed: int = 768,
-        n_decoder_layers: int = 12,
-        n_heads: int = 12,
-        dropout: float = 0.1,
-        id: str = "GPT1Core",
-    ):
-        super().__init__(id=id)
-        self.embedding = Embedding(
-            n_vocab=n_vocab,
-            n_tokens=n_tokens,
-            dim_embed=dim_embed,
-            dropout=dropout,
-        )
-        self.decoder = DecoderKarpathy(
+        self.decoder = Decoder(
             dim_input=dim_embed,
             n_decoder_layers=n_decoder_layers,
             n_heads=n_heads,
@@ -734,61 +501,7 @@ class GPT1CoreKarpathy(VerboseIOModule):
         self.apply(self._init_weights)
 
 
-class GPT1PretrainFast(GPT1CoreFast):
-    def __init__(
-        self,
-        n_vocab: int,
-        n_tokens=512,
-        dim_embed: int = 768,
-        n_decoder_layers: int = 12,
-        n_heads: int = 12,
-        dropout: float = 0.1,
-        id: str = "GPT1Pretrain",
-    ):
-        super().__init__(
-            n_vocab=n_vocab,
-            n_tokens=n_tokens,
-            dim_embed=dim_embed,
-            n_decoder_layers=n_decoder_layers,
-            n_heads=n_heads,
-            dropout=dropout,
-            id=id,
-        )
-
-        self.lm_head = torch.nn.Linear(dim_embed, n_vocab, dtype=torch.half)
-
-    @VerboseIOModule.display_io_sizes()
-    def forward(
-        self,
-        x: Float[torch.Tensor, "n_batch n_tokens dim_input"],
-        mask: Bool[torch.Tensor, "n_batch n_tokens"],
-        target: Int[torch.Tensor, "n_batch n_tokens"] = None,
-    ) -> Union[Float[torch.Tensor, "n_batch n_tokens n_vocab"],Tuple[Float[torch.Tensor, "n_batch n_tokens n_vocab"],Float[torch.Tensor, "1"]]]:
-        """We extend the core class' forward method by 
-        - a language head that maps the last transformer layer's outputs back
-            into the vocabulary space, and
-        - an optional loss that is only invoked if the `target` arg is provided
-        """
-        d: Float[torch.Tensor, "n_batch n_tokens dim_input"] = super().forward(x, mask)
-
-        logit: Float[torch.Tensor, "n_batch n_tokens n_vocab"] = self.lm_head(d)
-
-        if target is not None:
-            # torch's cross entropy loss requires the vocabulary dimension in the
-            # second rank as per https://pytorch.org/docs/stable/generated/...
-            # ...torch.nn.CrossEntropyLoss.html#crossentropyloss
-            logit_T: Float[torch.Tensor, "n_batch n_vocab n_tokens"] = logit.transpose(
-                -2, -1
-            )
-
-            loss = torch.nn.functional.cross_entropy(logit_T,target)
-
-            return logit, loss
-
-        return logit
-
-
-class GPT1PretrainKarpathy(GPT1CoreKarpathy):
+class GPT1Pretrain(GPT1Core):
     def __init__(
         self,
         n_vocab: int,
