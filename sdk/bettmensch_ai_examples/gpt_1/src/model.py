@@ -151,7 +151,7 @@ class Embedding(VerboseIOModule):
             dtype=torch.half
         )
         self.dropout = torch.nn.Dropout(p=dropout)
-        self.register_buffer("positions", positions = torch.range(0,self.max_length,dtype=torch.half))
+        self.register_buffer("positions", torch.arange(start=0,end=self.max_length,step=1,dtype=torch.int64))
 
     @VerboseIOModule.display_io_sizes()
     def forward(

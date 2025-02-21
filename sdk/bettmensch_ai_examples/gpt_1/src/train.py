@@ -2,6 +2,7 @@ import pickle
 import sys
 from datetime import datetime as dt
 import yaml
+from yaml import Loader
 from typing import Any, List, Tuple, Dict, Optional, Literal
 
 import GPUtil
@@ -114,7 +115,7 @@ class GPT1PretrainConfig:
     @classmethod
     def from_file(cls, file_path: str):
         with open(file_path,"r") as yaml_file:
-            config_dict = yaml.load(yaml_file)
+            config_dict = yaml.load(yaml_file,Loader=Loader)
 
         return cls(config_dict)
 
@@ -122,7 +123,6 @@ class GPT1Trainer:
 
     model: GPT1Pretrain
     optimizer: torch.optim.Optimizer
-    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
     summary_writer = torch.utils.tensorboard.writer.SummaryWriter(
         "runs/gpt1_pretrain_{}".format(dt.now().strftime("%Y%m%d_%H%M%S"))
     )
@@ -131,7 +131,7 @@ class GPT1Trainer:
         self.config = config
     
     def tb_log(self,*args,**kwargs):
-        self.summary_writer.add_scalar(*args,**kwargs)
+        self.summary_writer.add_scalars(*args,**kwargs)
 
     def log_step(self, epoch_index: int, batch_index: int, batch_size: int, n_batches: int, step_loss: float):
         """Displays step level progress on console and logs to tensorboard.
@@ -158,7 +158,7 @@ class GPT1Trainer:
             epoch_index * n_batches + batch_index + 1
         )
         self.tb_log(
-            "Batch train loss", step_loss, global_batch_index
+            "Batch train loss", {"Training": step_loss}, global_batch_index
         )
         gpu = GPUtil.getGPUs()[0]
         self.tb_log(
@@ -200,16 +200,17 @@ class GPT1Trainer:
     ) -> float:
 
         assert self.model is not None
+        self.model.to(0)
 
         if train:
             assert self.optimizer is not None
-            assert self.scheduler is not None
             self.model.train()
             self.model.init_weights()
         else:
             self.model.eval()
 
         n_batches = len(data_loader)
+        max_batches = n_batches if self.config['training']["n_batches"] == -1 else self.config['training']["n_batches"]
         batch_size = data_loader.batch_size
         display_step = self.config['training']["display_step"]
 
@@ -221,6 +222,9 @@ class GPT1Trainer:
         # iter(training_loader) so that we can track the batch
         # index and do some intra-epoch reporting
         for batch_index, (inputs, mask, target) in enumerate(data_loader):
+
+            if batch_index > max_batches:
+                break
 
             # Every data instance is an input + label pair
             inputs = inputs.to(0)
@@ -240,8 +244,7 @@ class GPT1Trainer:
 
                 # update model weights and learning rate
                 self.optimizer.step()
-                self.scheduler.step()
-
+                
             # Gather data and report
             running_loss += loss.item()
 
@@ -277,10 +280,6 @@ class GPT1Trainer:
             model.parameters(), 
             **self.config['optimizer']
         )
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer=self.optimizer,
-            **self.config['scheduler']
-        )
 
         for epoch_index in range(self.config['training']["n_epochs"]):
             print(f"EPOCH {epoch_index + 1}:")
@@ -305,7 +304,7 @@ class GPT1Trainer:
             self.log_epoch(epoch_index, train_loss, validation_loss)
 
 def pretrain(
-    pretrain_config: GPT1PretrainConfig = GPT1PretrainConfig.from_file(),
+    pretrain_config: GPT1PretrainConfig,
     # # dataset
     # train_data_path: str,
     # validation_data_path: str,
@@ -328,25 +327,29 @@ def pretrain(
     # verbose: bool = False,
 ):
 
-    train_data = TokenizedBookCorpusOpenSplit(pretrain_config['data']['train']['path'])
-    validation_data = TokenizedBookCorpusOpenSplit(pretrain_config['data']['validation']['path'])
+    train_data = TokenizedBookCorpusOpenSplit(pretrain_config.data['train']['path'])
+    validation_data = TokenizedBookCorpusOpenSplit(pretrain_config.data['validation']['path'])
 
     train_loader = torch.utils.data.DataLoader(
-        train_data, collate_fn=TokenizedBookCorpusOpenSplit.collate_batch, **pretrain_config['data']['train']['dataloader'],
-    )
-    validation_loader = torch.utils.data.DataLoader(
-        validation_data, collate_fn=TokenizedBookCorpusOpenSplit.collate_batch, **pretrain_config['data']['validation']['dataloader'],
+        train_data, collate_fn=TokenizedBookCorpusOpenSplit.collate_batch, **pretrain_config.data['train']['dataloader'],
     )
 
-    tokenizer = OpenAIGPTTokenizerFast.from_pretrained(pretrain_config['tokenizer']['path'])
+    if pretrain_config.data['validation']['use']:
+        validation_loader = torch.utils.data.DataLoader(
+            validation_data, collate_fn=TokenizedBookCorpusOpenSplit.collate_batch, **pretrain_config.data['validation']['dataloader'],
+        )
+    else:
+        validation_loader = None
+
+    tokenizer = OpenAIGPTTokenizerFast.from_pretrained(pretrain_config.tokenizer['path'])
     gpt1 = GPT1Pretrain(
         n_vocab=tokenizer.vocab_size,
-        **pretrain_config['model']['architecture'],
+        **pretrain_config.model['architecture'],
         id="GPT1Pretrain",
     )
-    gpt1.set_io_verbosity(pretrain_config['model']['misc']['verbose'])    
+    gpt1.set_io_verbosity(pretrain_config.model['misc']['verbose'])    
 
-    trainer = GPT1Trainer(pretrain_config['trainer'])
+    trainer = GPT1Trainer(pretrain_config.trainer)
 
     trainer.train(
         model=gpt1,
