@@ -1,5 +1,5 @@
 from bettmensch_ai.pipelines import Pipeline, as_pipeline
-from component import (
+from .component import (
     get_tokenizers_and_vocabularies_factory,
     train_transformer_factory,
 )

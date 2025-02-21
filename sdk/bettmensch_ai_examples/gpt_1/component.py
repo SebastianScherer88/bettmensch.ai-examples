@@ -7,7 +7,7 @@ from bettmensch_ai.pipelines.io import (
     InputParameter,
     OutputArtifact,
 )
-from src.train import tokenize_for_language_modelling, pretrain, size_in_gb
+from .src.train import tokenize_for_language_modelling, pretrain, size_in_gb
 
 
 def get_source_data_split(
@@ -87,11 +87,14 @@ def pretrain_and_checkpoint(
     tokenized_train: InputArtifact,
     tokenized_validation: InputArtifact,
     tokenizer: InputArtifact,
+    architecture: InputParameter,
     sequence_length: InputParameter = 512,
     dim_embed: InputParameter = 768,
     n_decoder_layers: InputParameter = 12,
     n_heads: InputParameter = 12,
     dropout: InputParameter = 0.1,
+    learning_rate: InputParameter = 0.00025,
+    weight_decay: InputParameter = 0.01,
     n_epochs: InputParameter = 10,
     batch_size: InputParameter = 2,
     display_step: InputParameter = 20,
@@ -102,11 +105,14 @@ def pretrain_and_checkpoint(
         train_data_path=tokenized_train.path,
         validation_data_path=tokenized_validation.path,
         tokenizer_path=tokenizer.path,
+        architecture=architecture,
         sequence_length=sequence_length,
         dim_embed=dim_embed,
         n_decoder_layers=n_decoder_layers,
         n_heads=n_heads,
         dropout=dropout,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
         n_epochs=n_epochs,
         batch_size=batch_size,
         display_step=display_step,
