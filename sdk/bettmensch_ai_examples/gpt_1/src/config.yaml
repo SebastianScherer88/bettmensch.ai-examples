@@ -1,0 +1,35 @@
+tokenizer:
+  path: tokenizer_train
+data:
+  train: 
+    path: tokenized_data_train
+    dataloader:
+      batch_size: 32
+      shuffle: True
+  validation: 
+    path: tokenized_data_validation
+    dataloader:
+      batch_size: 64 # larger than training since no gradients and optimizer state in memory
+      shuffle: False
+model:
+  architecture:
+    sequence_length: 512
+    dim_embed: 768
+    n_decoder_layers: 12
+    n_heads: 12
+    dropout: 0.1
+  misc:
+    verbose: False
+trainer:
+  optimizer:
+    learning_rate: 0.00025
+    weight_decay: 0.01
+    eps: 1e-4
+  scheduler:
+    max_lr: 0.00025
+    total_steps: 250000
+    anneal_strategy: 'cos'
+    pct_start: 0.10
+  training:
+    n_epochs: 10
+    display_step: 10
