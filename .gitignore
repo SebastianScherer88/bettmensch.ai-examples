@@ -12,6 +12,12 @@ build/*
 sdk/build/*
 build_logs
 
+# train outputs
+*.arrow
+events.out.tfevents.*
+*.json
+*.txt
+
 # misc files
 *.pt
 check_manifests
