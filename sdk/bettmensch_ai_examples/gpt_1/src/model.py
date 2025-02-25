@@ -143,12 +143,12 @@ class Embedding(VerboseIOModule):
         self.token = torch.nn.Embedding(
             num_embeddings=n_vocab,
             embedding_dim=dim_embed,
-            dtype=torch.half
+            
         )
         self.pos = torch.nn.Embedding(
             num_embeddings=n_tokens,
             embedding_dim=dim_embed,
-            dtype=torch.half
+            
         )
         self.dropout = torch.nn.Dropout(p=dropout)
         self.register_buffer("positions", torch.arange(start=0,end=self.max_length,step=1,dtype=torch.int64))
@@ -228,9 +228,9 @@ class MultiHeadedSelfAttention(VerboseIOModule):
         self.dim_sh_embed = int(dim_input / n_heads)
         self.scale = torch.sqrt(torch.tensor(self.dim_sh_embed,requires_grad=False))
 
-        self.projection_attention = torch.nn.Linear(self.dim_input, self.dim_input * 3,dtype=torch.half)
+        self.projection_attention = torch.nn.Linear(self.dim_input, self.dim_input * 3,)
         self.dropout_attention = torch.nn.Dropout(p=dropout)
-        self.projection_out = torch.nn.Linear(self.dim_input,self.dim_input,dtype=torch.half)
+        self.projection_out = torch.nn.Linear(self.dim_input,self.dim_input,)
         self.dropout_residual = torch.nn.Dropout(p=dropout)
 
     def forward(
@@ -326,9 +326,9 @@ class FeedForward(VerboseIOModule):
         self.dim_ff = dim_ff
 
         self.sequential = torch.nn.Sequential(
-            torch.nn.Linear(dim_input, dim_ff,dtype=torch.half),
+            torch.nn.Linear(dim_input, dim_ff,),
             activation_class(),
-            torch.nn.Linear(dim_ff, dim_input,dtype=torch.half),
+            torch.nn.Linear(dim_ff, dim_input,),
             torch.nn.Dropout(p=dropout),
         )
 
@@ -359,7 +359,6 @@ class SkipNorm(VerboseIOModule):
         self.skipped_layer = skipped_layer
         self.norm_layer = torch.nn.LayerNorm(
             normalized_shape=(skipped_layer.dim_input,),
-            dtype=torch.half
         )
 
     @VerboseIOModule.display_io_sizes()
@@ -461,6 +460,15 @@ class GPT1Core(VerboseIOModule):
         id: str = "GPT1Core",
     ):
         super().__init__(id=id)
+        self.config = {
+            "n_vocab":n_vocab,
+            "n_tokens": n_tokens,
+            "dim_embed": dim_embed,
+            "n_decoder_layers": n_decoder_layers,
+            "n_heads": n_heads,
+            "dropout": dropout,
+            "id":id,
+        }
         self.embedding = Embedding(
             n_vocab=n_vocab,
             n_tokens=n_tokens,
@@ -522,14 +530,14 @@ class GPT1Pretrain(GPT1Core):
             id=id,
         )
 
-        self.lm_head = torch.nn.Linear(dim_embed, n_vocab, dtype=torch.half)
+        #self.lm_head = torch.nn.Linear(dim_embed, n_vocab, )
 
     @VerboseIOModule.display_io_sizes()
     def forward(
         self,
         x: Float[torch.Tensor, "n_batch n_tokens dim_input"],
         mask: Bool[torch.Tensor, "n_batch n_tokens"],
-        target: Float[torch.Tensor, "n_batch n_tokens"],
+        target: Optional[Float[torch.Tensor, "n_batch n_tokens"]] = None,
     ) -> Union[Float[torch.Tensor, "n_batch n_tokens n_vocab"],Tuple[Float[torch.Tensor, "n_batch n_tokens n_vocab"],Float[torch.Tensor, "1"]]]:
         """We extend the core class' forward method by 
         - a language head that maps the last transformer layer's outputs back
@@ -537,8 +545,8 @@ class GPT1Pretrain(GPT1Core):
         - an optional loss that is only invoked if the `target` arg is provided
         """
         d: Float[torch.Tensor, "n_batch n_tokens dim_input"] = super().forward(x, mask)
-
-        logit: Float[torch.Tensor, "n_batch n_tokens n_vocab"] = self.lm_head(d)
+        logit: Float[torch.Tensor, "n_batch n_tokens n_vocab"] = torch.matmul(d,self.embedding.token.weight.transpose(-1,-2))
+        #logit: Float[torch.Tensor, "n_batch n_tokens n_vocab"] = self.lm_head(d)
 
         if target is not None:
             # torch's cross entropy loss requires the vocabulary dimension in the
@@ -549,7 +557,7 @@ class GPT1Pretrain(GPT1Core):
             )
 
             loss = torch.nn.functional.cross_entropy(logit_T,target)
+        else:
+            loss = None
 
-            return logit, loss
-
-        return logit
+        return logit, loss

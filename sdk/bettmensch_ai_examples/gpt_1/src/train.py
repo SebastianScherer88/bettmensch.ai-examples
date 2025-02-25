@@ -1,6 +1,7 @@
 import pickle
 import sys
 from datetime import datetime as dt
+import torch.amp
 import yaml
 from yaml import Loader
 from typing import Any, List, Tuple, Dict, Optional, Literal
@@ -14,10 +15,16 @@ import torch.utils.tensorboard.summary
 from .model import GPT1Pretrain
 from transformers import OpenAIGPTConfig, OpenAIGPTTokenizerFast
 from jaxtyping import Float
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
-config = OpenAIGPTConfig()
-config
+# config = OpenAIGPTConfig()
+# config
 
+def seed(value: int):
+    import numpy, random, torch
+    numpy.random.seed(value)
+    torch.manual_seed(value)
+    random.seed(value)
 
 def size_in_gb(object: Any) -> float:
     return sys.getsizeof(object) / 1024**3
@@ -107,6 +114,7 @@ class TokenizedBookCorpusOpenSplit(torch.utils.data.Dataset):
 class GPT1PretrainConfig:
 
     def __init__(self,config: Dict):
+        self.seed = config['seed']
         self.tokenizer = config['tokenizer']
         self.data = config['data']
         self.model = config['model']
@@ -123,17 +131,23 @@ class GPT1Trainer:
 
     model: GPT1Pretrain
     optimizer: torch.optim.Optimizer
-    summary_writer = torch.utils.tensorboard.writer.SummaryWriter(
-        "runs/gpt1_pretrain_{}".format(dt.now().strftime("%Y%m%d_%H%M%S"))
-    )
+    scaler: Optional[torch.amp.grad_scaler.GradScaler] = None
+    scheduler: torch.optim.lr_scheduler.SequentialLR
+    summary_writer: torch.utils.tensorboard.writer.SummaryWriter
+    n_completed_epochs: int = 0
+    train_loss_history: List[float] = []
+    validation_loss_history: List[float] = []
     
     def __init__(self, config: Dict):
         self.config = config
+        self.summary_writer = torch.utils.tensorboard.writer.SummaryWriter(
+            "runs/gpt1_pretrain_{}".format(dt.now().strftime("%Y%m%d_%H%M%S"))
+        )
     
     def tb_log(self,*args,**kwargs):
         self.summary_writer.add_scalars(*args,**kwargs)
 
-    def log_step(self, epoch_index: int, batch_index: int, batch_size: int, n_batches: int, step_loss: float):
+    def log_step(self, batch_index: int, batch_size: int, n_batches: int, step_loss: float):
         """Displays step level progress on console and logs to tensorboard.
 
         Args:
@@ -155,7 +169,7 @@ class GPT1Trainer:
         )
 
         global_batch_index = (
-            epoch_index * n_batches + batch_index + 1
+            self.n_completed_epochs * n_batches + batch_index + 1
         )
         self.tb_log(
             "Batch train loss", {"Training": step_loss}, global_batch_index
@@ -167,11 +181,16 @@ class GPT1Trainer:
             global_batch_index,
         )
 
-    def log_epoch(self, epoch_index: int, train_loss: float, validation_loss: float):
+        self.tb_log(
+            "Learning rate",
+            {"LR": self.optimizer.param_groups[0]['lr']},
+             global_batch_index
+        )
+
+    def log_epoch(self, train_loss: float, validation_loss: float):
         """Displays epoch level progress on console and logs to tensorboard.
 
         Args:
-            epoch_index (int): The index of the current epoch
             train_loss (float): The training loss for the current epoch
             validation_loss (float): The validation loss for the current epoch
         """
@@ -179,16 +198,16 @@ class GPT1Trainer:
         # display and log evaluation data
         print(
             f"{now()} | Train loss {train_loss} for last step of epoch"
-            f" {epoch_index+1}"
+            f" {self.n_completed_epochs+1}"
         )
         print(
-            f"{now()} | Validation loss {validation_loss} for epoch {epoch_index+1}"
+            f"{now()} | Validation loss {validation_loss} for epoch {self.n_completed_epochs+1}"
         )
 
         self.tb_log(
             "Epoch train vs. validation loss",
             {"Training": train_loss, "Validation": validation_loss},
-            epoch_index + 1,
+            self.n_completed_epochs + 1,
         )
         self.summary_writer.flush()
 
@@ -196,7 +215,6 @@ class GPT1Trainer:
         self,
         data_loader: torch.utils.data.DataLoader,
         train: bool = True,
-        epoch_index: int = 0,
     ) -> float:
 
         assert self.model is not None
@@ -205,7 +223,8 @@ class GPT1Trainer:
         if train:
             assert self.optimizer is not None
             self.model.train()
-            self.model.init_weights()
+            if self.n_completed_epochs == 0:
+                self.model.init_weights()
         else:
             self.model.eval()
 
@@ -217,6 +236,7 @@ class GPT1Trainer:
         total_loss = 0.0
         step_loss = 0.0
         running_loss = 0.0
+        total_loss = []
 
         # Here, we use enumerate(training_loader) instead of
         # iter(training_loader) so that we can track the batch
@@ -231,19 +251,34 @@ class GPT1Trainer:
             mask = mask.to(0)
             target = target.to(0)
 
-            # Zero your gradients for every batch!
-            self.optimizer.zero_grad()
-
             # Make predictions for this batch
-            logits, loss = self.model(inputs, mask, target)
+            with torch.set_grad_enabled(train), torch.amp.autocast(device_type="cuda",dtype=torch.float16,enabled=self.config['training']['use_amp']):
+                logits, loss = self.model(inputs, mask, target)
 
             if train:
-                # Compute the loss and its gradients
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(),max_norm=1)
+                self.optimizer.zero_grad(set_to_none=True)
 
-                # update model weights and learning rate
-                self.optimizer.step()
+                if self.config['training']['scale_gradients']:
+                    # Compute the loss and its gradients
+                    self.scaler.scale(loss).backward()
+
+                    # clip
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1)
+
+                    # update model weights and learning rate
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.scheduler.step()
+                else:
+                    # Compute the loss and its gradients
+                    loss.backward()
+
+                    # clip
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1)
+
+                    # update model weights and learning rate
+                    self.optimizer.step()
+                    self.scheduler.step()
                 
             # Gather data and report
             running_loss += loss.item()
@@ -252,19 +287,71 @@ class GPT1Trainer:
 
                 # average loss over last display_step batches
                 step_loss = running_loss / display_step
-                total_loss += step_loss
+                total_loss.append(step_loss)
 
-                self.log_step(epoch_index,batch_index,batch_size,n_batches,step_loss)
-
+                self.log_step(batch_index,batch_size,n_batches,step_loss)
                 running_loss = 0.0
 
-        return total_loss
+        return sum(total_loss) / len(total_loss)
+    
+    def save_checkpoint(self, path: str):
+        """Creates checkpoint from which training can be resumed.
+
+        Args:
+            path (str): The location on disk to create the checkpoint.
+        """
+        torch.save(
+            {
+                'trainer_config':self.config,
+                'n_completed_epochs': self.n_completed_epochs,
+                'train_loss_history': self.train_loss_history,
+                'validation_loss_history': self.validation_loss_history,
+                'model_config': self.model.config,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+            },
+            path
+        )
+
+    def load_checkpoint(self, path: str):
+        """Loads created checkpoint to resume training from.
+
+        Args:
+            path (str): The location on disk to load the checkpoint from.
+        """
+        checkpoint_dict = torch.load(path, weights_only=True)
+        
+        # trainer config & state
+        self.config = checkpoint_dict['trainer_config']
+        self.n_completed_epochs = checkpoint_dict['n_completed_epochs']
+        self.train_loss_history = checkpoint_dict['train_loss_history']
+        self.validation_loss_history = checkpoint_dict['validation_loss_history']
+        
+        # model
+        self.model = GPT1Pretrain(**checkpoint_dict['model_config'])
+        self.model.load_state_dict(checkpoint_dict['model_state_dict'])
+
+        # optimizer
+        self.optimizer = torch.optim.AdamW(self.model.parameters(),**self.config['optimizer'])
+        self.optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+
+        # scaler
+        if self.config['training']['scale_gradients']:
+            self.scaler = torch.amp.grad_scaler.GradScaler("cuda")
+
+        # scheduler
+        linear_scheduler = LinearLR(self.optimizer, **self.config['scheduler']['linear']),#start_factor=0.0001, end_factor=1, total_iters=50)
+        cosine_scheduler = CosineAnnealingLR(self.optimizer,**self.config['scheduler']['cosine'])#T_max=25,eta_min=0)
+        self.scheduler = SequentialLR(self.optimizer, schedulers=[linear_scheduler,cosine_scheduler],**self.config['scheduler']['sequential'])#milestones=[50])
+        self.scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
 
     def train(
             self,
-            model: GPT1Pretrain,
             train_loader: torch.utils.data.DataLoader,
-            validation_loader: Optional[torch.utils.data.DataLoader] = None
+            model: Optional[GPT1Pretrain] = None,
+            validation_loader: Optional[torch.utils.data.DataLoader] = None,
+            checkpoint: Optional[str] = None,
         ):
         """Main training loop.
 
@@ -274,74 +361,74 @@ class GPT1Trainer:
             validation_loader (torch.utils.data.DataLoader): _description_
         """
 
-        # set attributes needed for training
-        self.model = model
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(), 
-            **self.config['optimizer']
-        )
+        # if training from scratch, set attributes needed for training.
+        # if training from checkpoint, set attributes from checkpoint
+        if model and (checkpoint is None):
+            self.model = model
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(), 
+                **self.config['optimizer']
+            )
+            if self.config['training']['scale_gradients']:
+                self.scaler = torch.amp.grad_scaler.GradScaler("cuda")
+            linear_scheduler = LinearLR(self.optimizer, **self.config['scheduler']['linear'])#start_factor=0.0001, end_factor=1, total_iters=50)
+            cosine_scheduler = CosineAnnealingLR(self.optimizer,**self.config['scheduler']['cosine'])#T_max=25,eta_min=0)
+            self.scheduler = SequentialLR(self.optimizer, schedulers=[linear_scheduler,cosine_scheduler],**self.config['scheduler']['sequential'])#milestones=[50])
+        elif (model is None) and checkpoint:
+            self.load_checkpoint(checkpoint)
+        else:
+            raise ValueError(f"Only one of `model` and `checkpoint` arguments"
+                             " can be provided.")
 
-        for epoch_index in range(self.config['training']["n_epochs"]):
-            print(f"EPOCH {epoch_index + 1}:")
+        while self.n_completed_epochs < self.config['training']["n_epochs"]:
+            print(f"EPOCH {self.n_completed_epochs + 1}:")
 
             # run training and retrieve loss averaged over last 1000 batches of
             # training split
             train_loss = self.run_epoch(
                 data_loader=train_loader,
                 train=True,
-                epoch_index=epoch_index,
             )
+            self.train_loss_history.append(train_loss)
 
             if validation_loader is not None:
                 validation_loss = self.run_epoch(
                     data_loader=validation_loader,
                     train=False,
-                    epoch_index=epoch_index
                 )
             else:
                 validation_loss = -1
+            self.validation_loss_history.append(validation_loss)
 
-            self.log_epoch(epoch_index, train_loss, validation_loss)
+            # log progress using current epoch index
+            self.log_epoch(train_loss, validation_loss)
+
+            # update epoch counter to reflect newly completed epoch before 
+            # checkpointing            
+            self.n_completed_epochs += 1
+            self.save_checkpoint(str(self.n_completed_epochs))
 
 def pretrain(
     pretrain_config: GPT1PretrainConfig,
-    # # dataset
-    # train_data_path: str,
-    # validation_data_path: str,
-    # # dataloader
-    # batch_size: int,
-    # # tokenizer
-    # tokenizer_path: str,
-    # # model
-    # sequence_length: int = 512,
-    # dim_embed: int = 768,
-    # n_decoder_layers: int = 12,
-    # n_heads: int = 12,
-    # dropout: float = 0.1,
-    # # optimizer
-    # learning_rate: float = 0.00025,
-    # weight_decay: float = 0.01,
-    # # training
-    # n_epochs: int = 10,
-    # display_step: int = 10,
-    # verbose: bool = False,
 ):
 
+    seed(pretrain_config.seed)
     train_data = TokenizedBookCorpusOpenSplit(pretrain_config.data['train']['path'])
-    validation_data = TokenizedBookCorpusOpenSplit(pretrain_config.data['validation']['path'])
 
     train_loader = torch.utils.data.DataLoader(
-        train_data, collate_fn=TokenizedBookCorpusOpenSplit.collate_batch, **pretrain_config.data['train']['dataloader'],
+        train_data, collate_fn=TokenizedBookCorpusOpenSplit.collate_batch, **pretrain_config.data['train']['dataloader']
     )
 
     if pretrain_config.data['validation']['use']:
+        validation_data = TokenizedBookCorpusOpenSplit(pretrain_config.data['validation']['path'])
         validation_loader = torch.utils.data.DataLoader(
-            validation_data, collate_fn=TokenizedBookCorpusOpenSplit.collate_batch, **pretrain_config.data['validation']['dataloader'],
+            validation_data, collate_fn=TokenizedBookCorpusOpenSplit.collate_batch, **pretrain_config.data['validation']['dataloader'],generator=torch.Generator(device="cuda")
         )
     else:
         validation_loader = None
 
     tokenizer = OpenAIGPTTokenizerFast.from_pretrained(pretrain_config.tokenizer['path'])
+    
     gpt1 = GPT1Pretrain(
         n_vocab=tokenizer.vocab_size,
         **pretrain_config.model['architecture'],

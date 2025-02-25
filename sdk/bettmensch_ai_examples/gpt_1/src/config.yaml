@@ -1,20 +1,21 @@
+seed: 10
 tokenizer:
   path: tokenizer_train
 data:
   train: 
-    path: tokenized_data_train
+    path: tokenized_data_validation
     dataloader:
-      batch_size: 32
+      batch_size: 45
       shuffle: True
   validation:
     use: False
     path: tokenized_data_validation
     dataloader:
-      batch_size: 32 # larger than training since no gradients and optimizer state in memory
+      batch_size: 80 # larger than training since no gradients and optimizer state in memory
       shuffle: False
 model:
   architecture:
-    n_tokens: 512
+    n_tokens: 128
     dim_embed: 768
     n_decoder_layers: 12
     n_heads: 12
@@ -25,8 +26,24 @@ trainer:
   optimizer:
     lr: 0.00025
     weight_decay: 0.01
+    betas:
+      - 0.9
+      - 0.95
     eps: 0.0001 # 0.0001 needed when running on torch.half dtype
+  scheduler:
+    linear:
+      start_factor: 0.0001
+      end_factor: 1
+      total_iters: 100
+    cosine:
+      T_max: 500
+      eta_min: 0
+    sequential:
+      milestones:
+        - 1000
   training:
-    n_epochs: 10
+    n_epochs: 1
     n_batches: -1
     display_step: 10
+    use_amp: False
+    scale_gradients: False
