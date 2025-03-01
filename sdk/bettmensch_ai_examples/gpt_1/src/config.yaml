@@ -3,13 +3,17 @@ tokenizer:
   path: tokenizer_train
 data:
   train: 
-    path: tokenized_data_validation
+    dataset:
+      path: tokenized_data_validation
+      context_size: 128
     dataloader:
       batch_size: 45
       shuffle: True
   validation:
-    use: False
-    path: tokenized_data_validation
+    use: True
+    dataset:
+      path: tokenized_data_validation
+      context_size: 128
     dataloader:
       batch_size: 80 # larger than training since no gradients and optimizer state in memory
       shuffle: False
@@ -34,16 +38,16 @@ trainer:
     linear:
       start_factor: 0.0001
       end_factor: 1
-      total_iters: 100
+      total_iters: 2000
     cosine:
       T_max: 500
       eta_min: 0
     sequential:
       milestones:
-        - 1000
+        - 2000
   training:
-    n_epochs: 1
-    n_batches: -1
-    display_step: 10
-    use_amp: False
-    scale_gradients: False
+    grad_clip_norm: 1.0
+    n_steps: 1000000 # training duration in batches
+    eval_steps: 50 # evaluation interval in batches
+    n_steps_eval: 10 # number of batches used for evaluation
+    checkpoint_steps: 7500 # checkpointing interval in batches

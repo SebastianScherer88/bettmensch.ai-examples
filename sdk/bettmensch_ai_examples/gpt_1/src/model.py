@@ -4,131 +4,9 @@ import torch
 from jaxtyping import Bool, Float, Int
 import torch.utils
 
+class Embedding(torch.nn.Module):
 
-class VerboseIOModule(torch.nn.Module):
-    """Utility Mixin to allow for toggling of the IO shape display at runtime.
-    Useful for debugging model architecture."""
-
-    _id: Optional[str] = None
-    _verbose: bool = False
-    _nest_level: Optional[int] = None
-
-    def __init__(self, id: Optional[str] = None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._id = id
-        # self.forward = self.display_io_sizes(id)(self.forward)
-
-    def set_io_verbosity(self, value: bool):
-        self._verbose = value
-
-        # set on all child modules
-        for module in self.modules():
-            if isinstance(module, VerboseIOModule) and module != self:
-                module._verbose = value
-
-    def set_nest_level(self, level: int = 0):
-        assert (
-            self.nest_level is None
-        ), f"Nest level {self.nest_level} has already been set and "
-        f"cannot be re-set for {self.id}"
-        self._nest_level = level
-
-        # cascade to child modules in nested fashion to generate correct nest
-        # level we need to skip modules that have the level set already as each
-        # module has line of sight of ALL its child modules' descendants (as
-        # opposed to just its own child modules)
-        for module in self.modules():
-            if (
-                isinstance(module, VerboseIOModule)
-                and (module != self)  # noqa: W503
-                and (module.nest_level is None)  # noqa: W503
-            ):
-                module.set_nest_level(level=self.nest_level + 1)
-
-    @property
-    def id(self) -> Union[str, None]:
-        return self._id
-
-    @property
-    def is_verbose(self) -> bool:
-        return self._verbose
-
-    @property
-    def nest_level(self) -> int:
-        return self._nest_level
-
-    @staticmethod
-    def display_io_sizes(id: Optional[str] = None):
-        def wrapper(forward: Callable):
-            def func(*args, **kwargs):
-
-                parent_module_mixin = args[0]
-                assert isinstance(parent_module_mixin, VerboseIOModule)
-                if id is not None:
-                    display_id = id
-                elif parent_module_mixin.id is not None:
-                    display_id = parent_module_mixin.id
-                else:
-                    display_id = str(type(parent_module_mixin))
-
-                indent = parent_module_mixin.nest_level * "    "
-                verbose = parent_module_mixin.is_verbose
-
-                if verbose:
-                    for i, arg in enumerate(args[1:]):
-                        try:
-                            print(
-                                f"{indent}[{display_id}]'s positional input"
-                                f" {i+1}'s size: {arg.size()}"
-                            )
-                            print(
-                                f"{indent}[{display_id}]'s positional input"
-                                f" {i+1}'s GPU device: {arg.get_device()}"
-                            )
-                        except AttributeError:
-                            print(
-                                f"{indent}[{display_id}]'s positional input"
-                                f" {i+1} is not a torch tensor: {type(arg)}"
-                            )
-
-                    for arg_name, arg_value in kwargs.items():
-                        try:
-                            print(
-                                f"{indent}[{display_id}]'s named input"
-                                f" {arg_name}'s size: {arg_value.size()}"
-                            )
-                            print(
-                                f"{indent}[{display_id}]'s name input"
-                                f" {arg_name}'s GPU device: "
-                                f"{arg_value.get_device()}"
-                            )
-                        except AttributeError:
-                            continue
-
-                result = forward(*args, **kwargs)
-
-                if verbose:
-                    try:
-                        print(
-                            f"{indent}[{display_id}]'s output's size:"
-                            f" {result.size()}"
-                        )
-                    except AttributeError:
-                        print(
-                            f"{indent}[{display_id}]'s output is not a torch"
-                            f" tensor: {type(result)}"
-                        )
-
-                return result
-
-            return func
-
-        return wrapper
-
-
-class Embedding(VerboseIOModule):
-
-    positions: Int[torch.nn.UninitializedBuffer, "-1"]
+    positions: Int[torch.nn.UninitializedBuffer, "n_tokens"]
 
     def __init__(
         self,
@@ -136,115 +14,82 @@ class Embedding(VerboseIOModule):
         n_tokens: int = 512,
         dim_embed: int = 768,
         dropout: float = 0.1,
-        id: str = "Embedding",
     ):
-        super().__init__(id=id)
+        super().__init__()
         self.max_length = n_tokens
         self.token = torch.nn.Embedding(
             num_embeddings=n_vocab,
             embedding_dim=dim_embed,
-            
+            dtype=torch.bfloat16,
         )
         self.pos = torch.nn.Embedding(
             num_embeddings=n_tokens,
             embedding_dim=dim_embed,
-            
+            dtype=torch.bfloat16,
         )
         self.dropout = torch.nn.Dropout(p=dropout)
         self.register_buffer("positions", torch.arange(start=0,end=self.max_length,step=1,dtype=torch.int64))
 
-    @VerboseIOModule.display_io_sizes()
     def forward(
         self, x: Float[torch.Tensor, "n_batch n_tokens"]
     ) -> Float[torch.Tensor, "n_batch n_tokens dim_embed"]:
+        
+        _, n_tokens = x.size()
+        assert n_tokens <= self.max_length, f"Token sequence for batch exceeds max lenght of {self.max_length}"
 
         e_token: Float[
             torch.Tensor, "n_batch n_tokens dim_embed"
         ] = self.token(x)
 
-        e_pos: Float[torch.tensor, "1 n_tokens dim_embed"] = self.pos(self.positions).unsqueeze(0)
+        e_pos: Float[torch.tensor, "1 n_tokens dim_embed"] = self.pos(self.positions[:n_tokens]).unsqueeze(0)
 
         e = self.dropout(e_token + e_pos)
 
         return e
 
-
-def generate_padded_subsequent_mask(
-    input_mask: Bool[torch.Tensor, "n_batch n_tokens"]
-) -> Float[torch.Tensor, "n_batch n_tokens n_tokens"]:
-    """Generates a mask that, when passed to the attention function, forces the
-      coefficients to be 0 for
-    - values/tokens that come after the query/token in question in the original
-        input sequence
-    - values/tokens that stem from padded tokens in the original input
-        sequence,
-    thus forcing the attention to the non-trivial set of values/tokens. This
-    reduces noise during optimization, which speeds up training and improves
-     model performance
-    """
-
-    device = input_mask.get_device()
-
-    n_tokens = input_mask.size()[-1]
-    padded_token_mask: Float[
-        torch.Tensor, "n_batch 1 n_tokens"
-    ] = input_mask.unsqueeze(1)
-    subsequent_token_mask: Float[torch.Tensor, "1 n_tokens n_tokens"] = (
-        torch.tril(torch.ones(size=(n_tokens, n_tokens)))
-        .type(torch.bool)
-        .unsqueeze(0)
-    )
-
-    if device != -1:
-        subsequent_token_mask = subsequent_token_mask.to(device)
-
-    final_mask = (padded_token_mask & subsequent_token_mask)
-
-    if device != -1:
-        final_mask = final_mask.to(device)
-
-    return final_mask
-
-
-class MultiHeadedSelfAttention(VerboseIOModule):
+class MultiHeadedSelfAttention(torch.nn.Module):
     """Implements tensorized attention based on Andrej Karpaty's MinGPT"""
+
+    causal_mask: Bool[torch.Tensor, "1 1 n_tokens n_tokens"]
 
     def __init__(
         self,
-            n_heads: int = 12,
-            dim_input: int = 768,
-            dropout: float = 0.1,
-            id: str = "MultiHeadAttentionKarpaty",
+        n_tokens: int = 512,
+        n_heads: int = 12,
+        dim_embed: int = 768,
+        dropout: float = 0.1,
     ):
-        super().__init__(id=id)
+        super().__init__()
 
         assert (
-            dim_input % n_heads == 0
-        ), f"Query & value embedding size {dim_input} is not divisable by "
+            dim_embed % n_heads == 0
+        ), f"Query & value embedding size {dim_embed} is not divisable by "
         f"attention head count {n_heads}"
 
+        self.max_length = n_tokens
         self.n_heads = n_heads
-        self.dim_input = dim_input
-        self.dim_sh_embed = int(dim_input / n_heads)
+        self.dim_embed = dim_embed
+        self.dim_sh_embed = int(dim_embed / n_heads)
         self.scale = torch.sqrt(torch.tensor(self.dim_sh_embed,requires_grad=False))
+        self.register_buffer("causal_mask",torch.tril(torch.ones(1,1,n_tokens,n_tokens)).to(torch.bool))
 
-        self.projection_attention = torch.nn.Linear(self.dim_input, self.dim_input * 3,)
+        self.projection_attention = torch.nn.Linear(self.dim_embed, self.dim_embed * 3,dtype=torch.bfloat16,)
         self.dropout_attention = torch.nn.Dropout(p=dropout)
-        self.projection_out = torch.nn.Linear(self.dim_input,self.dim_input,)
+        self.projection_out = torch.nn.Linear(self.dim_embed,self.dim_embed,dtype=torch.bfloat16,)
         self.dropout_residual = torch.nn.Dropout(p=dropout)
 
     def forward(
             self,
             x: Float[torch.Tensor, "n_batch n_tokens dim_embed"],
-            mask: Optional[Float[torch.Tensor, "n_batch n_tokens n_tokens"]],
         ) -> Float[torch.Tensor, "n_batch n_tokens dim_embed"]:
 
         n_batch, n_tokens, _ = x.size()
+        assert n_tokens <= self.max_length, f"Token sequence for batch exceeds max lenght of {self.max_length}"
 
         # do all query, key and value projections for all heads in one go 
         # yielding 3 tensors of dimension 
         # (n_batch, n_tokens, dim_embed)
-        q, k, v = self.projection_attention(x).split(self.dim_input,dim=-1)
+        q, k, v = self.projection_attention(x).split(self.dim_embed,dim=-1)
 
         # break down the query embedding into single head sized embeddings and
         # rearrange to add head dimension. This allows us to use transpose to 
@@ -269,8 +114,7 @@ class MultiHeadedSelfAttention(VerboseIOModule):
         #  to go from n_batch, 1, n_tokens, n_tokens 
         # to a compatible 4d tensor
         # (n_batch, 1, n_tokens, n_tokens)
-        mask_h = mask.unsqueeze(1)
-        coef_masked = coef.masked_fill(mask_h==False,float('-inf'))
+        coef_masked = coef.masked_fill(self.causal_mask[:,:,:n_tokens,:n_tokens] == False,float('-inf'))
 
         conv_coef = torch.nn.functional.softmax(coef_masked,dim=-1)
         conv_coef = self.dropout_attention(conv_coef)
@@ -286,13 +130,13 @@ class MultiHeadedSelfAttention(VerboseIOModule):
         # individual heads' attention outputs into one embedding vector for 
         # each token as required for the final step of multi head attention
         # (n_batch, n_tokens, n_dim_embed)
-        att = att_h.transpose(1,2).contiguous().view(n_batch, n_tokens, self.dim_input)
+        att = att_h.transpose(1,2).contiguous().view(n_batch, n_tokens, self.dim_embed)
 
         att_proj = self.projection_out(att)
 
         return self.dropout_residual(att_proj)
 
-class FeedForward(VerboseIOModule):
+class FeedForward(torch.nn.Module):
     """The feed forward layer (including dropout) as described in https://...
     ...cdn.openai.com/research-covers/language-unsupervised/...
     ...language_understanding_paper.pdf. Defaults to the exact configuration
@@ -300,11 +144,10 @@ class FeedForward(VerboseIOModule):
 
     def __init__(
         self,
-        dim_input: int = 768,
+        dim_embed: int = 768,
         dim_ff: int = 3072,
         dropout: float = 0.1,
         activation_class=torch.nn.GELU,
-        id: str = "FeedForward",
     ):
         """By default, the GELU activation is used as described in the
         https://cdn.openai.com/research-covers/language-unsupervised/...
@@ -320,134 +163,54 @@ class FeedForward(VerboseIOModule):
                 Defaults to nn.GELU.
         """
 
-        super().__init__(id=id)
+        super().__init__()
 
-        self.dim_input = dim_input
+        self.dim_embed = dim_embed
         self.dim_ff = dim_ff
 
         self.sequential = torch.nn.Sequential(
-            torch.nn.Linear(dim_input, dim_ff,),
+            torch.nn.Linear(dim_embed, dim_ff,dtype=torch.bfloat16,),
             activation_class(),
-            torch.nn.Linear(dim_ff, dim_input,),
+            torch.nn.Linear(dim_ff, dim_embed,dtype=torch.bfloat16,),
             torch.nn.Dropout(p=dropout),
         )
 
-    @VerboseIOModule.display_io_sizes()
     def forward(
-        self, x: Float[torch.Tensor, "n_batch n_tokens dim_input"]
-    ) -> Float[torch.Tensor, "n_batch n_tokens dim_input"]:
+        self, x: Float[torch.Tensor, "n_batch n_tokens dim_embed"]
+    ) -> Float[torch.Tensor, "n_batch n_tokens dim_embed"]:
         return self.sequential(x)
-
-class SkipNorm(VerboseIOModule):
-    """The skip + normalization layer (including dropout) wrapper as described
-    in https://cdn.openai.com/research-covers/language-unsupervised/...
-    ...language_understanding_paper.pdf"""
-
-    def __init__(
-        self,
-        skipped_layer: Union[MultiHeadedSelfAttention, FeedForward],
-        dropout: float = 0.1,
-        id: str = "SkipNorm",
-    ):
-        """_summary_
-
-        Args:
-            dropout (float, optional): The dropout rate. Defaults to 0.1.
-        """
-        super().__init__(id=id)
-        self.dropout = torch.nn.Dropout(p=dropout)
-        self.skipped_layer = skipped_layer
-        self.norm_layer = torch.nn.LayerNorm(
-            normalized_shape=(skipped_layer.dim_input,),
-        )
-
-    @VerboseIOModule.display_io_sizes()
-    def forward(
-        self,
-        x: Float[torch.Tensor, "n_batch n_tokens n_dim_input"],
-        *skipped_layer_args,
-        **skipped_layer_kwargs,
-    ) -> Float[torch.Tensor, "n_batch n_tokens n_dim_input"]:
-
-        return self.dropout(
-            self.norm_layer(
-                x
-                + self.skipped_layer(  # noqa: W503
-                    x, *skipped_layer_args, **skipped_layer_kwargs
-                )
-            )
-        )
-
     
-class DecoderLayer(VerboseIOModule):
+class DecoderLayer(torch.nn.Module):
 
     def __init__(
         self,
+        n_tokens: int = 512,
         n_heads: int = 12,
-        dim_input: int = 768,
+        dim_embed: int = 768,
         dropout: float = 0.1,
-        id: str = "DecoderLayer",
     ):
-        super().__init__(id=id)
-        self.skip_norm_mha = SkipNorm(
-            MultiHeadedSelfAttention(
-                n_heads=n_heads, dim_input=dim_input, dropout=dropout, id="mhsa_k"
-            ),
-            id="skip_mhsa_k",
+        super().__init__()
+        self.mha = MultiHeadedSelfAttention(
+            n_tokens=n_tokens, n_heads=n_heads, dim_embed=dim_embed, dropout=dropout,
         )
-        self.skip_norm_ff = SkipNorm(
-            FeedForward(dim_input=dim_input, dropout=dropout, id="ff"),
-            id="skip_ff",
+        self.skip_norm_mha = torch.nn.LayerNorm(
+            normalized_shape=(dim_embed,),dtype=torch.bfloat16,
+        )
+        self.ff = FeedForward(dim_embed=dim_embed, dropout=dropout)
+        self.skip_norm_ff = torch.nn.LayerNorm(
+            normalized_shape=(dim_embed,),dtype=torch.bfloat16,
         )
 
-    @VerboseIOModule.display_io_sizes()
     def forward(
         self,
-        x: Float[torch.Tensor, "n_batch n_tokens dim_input"],
-        mask: Bool[torch.Tensor, "n_batch n_tokens"],
-    ) -> Float[torch.Tensor, "n_batch n_tokens dim_input"]:
-        mha_mask = generate_padded_subsequent_mask(mask)
-        mha_out = self.skip_norm_mha(x=x, mask=mha_mask)
-        ff_out = self.skip_norm_ff(mha_out)
+        x: Float[torch.Tensor, "n_batch n_tokens dim_embed"],
+    ) -> Float[torch.Tensor, "n_batch n_tokens dim_embed"]:
+        mha_out = self.skip_norm_mha(self.mha(x=x) + x)
+        out = self.skip_norm_ff(self.ff(mha_out) + x)
 
-        return ff_out
+        return out
         
-class Decoder(VerboseIOModule):
-
-    def __init__(
-        self,
-        dim_input: int = 768,
-        n_decoder_layers: int = 12,
-        n_heads: int = 12,
-        dropout: float = 0.1,
-        id: str = "Decoder",
-    ):
-        super().__init__(id=id)
-
-        self.layers = torch.nn.ModuleList(
-            [
-                DecoderLayer(
-                    n_heads=n_heads,
-                    dim_input=dim_input,
-                    dropout=dropout,
-                    id=f"DecoderLayer_{i+1}",
-                )
-                for i in range(n_decoder_layers)
-            ]
-        )
-
-    @VerboseIOModule.display_io_sizes()
-    def forward(
-        self,
-        x: Float[torch.Tensor, "n_batch n_tokens dim_input"],
-        mask: Bool[torch.Tensor, "n_batch n_tokens"],
-    ) -> Float[torch.Tensor, "n_batch n_tokens dim_input"]:
-        for layer in self.layers:
-            x = layer(x, mask)
-
-        return x
-        
-class GPT1Core(VerboseIOModule):
+class GPT(torch.nn.Module):
 
     def __init__(
         self,
@@ -457,9 +220,8 @@ class GPT1Core(VerboseIOModule):
         n_decoder_layers: int = 12,
         n_heads: int = 12,
         dropout: float = 0.1,
-        id: str = "GPT1Core",
     ):
-        super().__init__(id=id)
+        super().__init__()
         self.config = {
             "n_vocab":n_vocab,
             "n_tokens": n_tokens,
@@ -467,7 +229,6 @@ class GPT1Core(VerboseIOModule):
             "n_decoder_layers": n_decoder_layers,
             "n_heads": n_heads,
             "dropout": dropout,
-            "id":id,
         }
         self.embedding = Embedding(
             n_vocab=n_vocab,
@@ -475,68 +236,21 @@ class GPT1Core(VerboseIOModule):
             dim_embed=dim_embed,
             dropout=dropout,
         )
-        self.decoder = Decoder(
-            dim_input=dim_embed,
-            n_decoder_layers=n_decoder_layers,
-            n_heads=n_heads,
-            dropout=dropout,
-        )
-        self.set_nest_level()
-
-    @VerboseIOModule.display_io_sizes()
-    def forward(
-        self,
-        x: Float[torch.Tensor, "n_batch n_tokens"],
-        mask: Bool[torch.Tensor, "n_batch n_tokens"],
-    ) -> Float[torch.Tensor, "n_batch n_tokens dim_input"]:
-        e = self.embedding(x)
-        d = self.decoder(e, mask)
-
-        return d
-    
-    def _init_weights(self, module):
-        if isinstance(module, torch.nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, torch.nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, torch.nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
-
-    def init_weights(self):
-        self.apply(self._init_weights)
-
-
-class GPT1Pretrain(GPT1Core):
-    def __init__(
-        self,
-        n_vocab: int,
-        n_tokens=512,
-        dim_embed: int = 768,
-        n_decoder_layers: int = 12,
-        n_heads: int = 12,
-        dropout: float = 0.1,
-        id: str = "GPT1Pretrain",
-    ):
-        super().__init__(
-            n_vocab=n_vocab,
-            n_tokens=n_tokens,
-            dim_embed=dim_embed,
-            n_decoder_layers=n_decoder_layers,
-            n_heads=n_heads,
-            dropout=dropout,
-            id=id,
+        self.decoder = self.layers = torch.nn.Sequential(
+            *[
+                DecoderLayer(
+                    n_heads=n_heads,
+                    n_tokens=n_tokens,
+                    dim_embed=dim_embed,
+                    dropout=dropout,
+                )
+                for _ in range(n_decoder_layers)
+            ]
         )
 
-        #self.lm_head = torch.nn.Linear(dim_embed, n_vocab, )
-
-    @VerboseIOModule.display_io_sizes()
     def forward(
         self,
-        x: Float[torch.Tensor, "n_batch n_tokens dim_input"],
-        mask: Bool[torch.Tensor, "n_batch n_tokens"],
+        x: Float[torch.Tensor, "n_batch n_tokens dim_embed"],
         target: Optional[Float[torch.Tensor, "n_batch n_tokens"]] = None,
     ) -> Union[Float[torch.Tensor, "n_batch n_tokens n_vocab"],Tuple[Float[torch.Tensor, "n_batch n_tokens n_vocab"],Float[torch.Tensor, "1"]]]:
         """We extend the core class' forward method by 
@@ -544,9 +258,9 @@ class GPT1Pretrain(GPT1Core):
             into the vocabulary space, and
         - an optional loss that is only invoked if the `target` arg is provided
         """
-        d: Float[torch.Tensor, "n_batch n_tokens dim_input"] = super().forward(x, mask)
+        e: Float[torch.Tensor, "n_batch n_tokens dim_embed"] = self.embedding(x)
+        d: Float[torch.Tensor, "n_batch n_tokens dim_embed"] = self.decoder(e)
         logit: Float[torch.Tensor, "n_batch n_tokens n_vocab"] = torch.matmul(d,self.embedding.token.weight.transpose(-1,-2))
-        #logit: Float[torch.Tensor, "n_batch n_tokens n_vocab"] = self.lm_head(d)
 
         if target is not None:
             # torch's cross entropy loss requires the vocabulary dimension in the
@@ -561,3 +275,17 @@ class GPT1Pretrain(GPT1Core):
             loss = None
 
         return logit, loss
+    
+    def _init_weights(self, module):
+        if isinstance(module, torch.nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, torch.nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, torch.nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
+    def init_weights(self):
+        self.apply(self._init_weights)

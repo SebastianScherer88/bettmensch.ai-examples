@@ -7,7 +7,7 @@ from bettmensch_ai.pipelines.io import (
     InputParameter,
     OutputArtifact,
 )
-from .src.train import tokenize_for_language_modelling, pretrain, size_in_gb
+from .src.train import tokenize_text, pretrain, size_in_gb
 
 
 def get_source_data_split(
@@ -59,11 +59,10 @@ def get_tokenized_data_split_and_tokenizer(
         }
     )
 
-    tokenized_data = tokenize_for_language_modelling(
+    tokenized_data = tokenize_text(
         data[start_index:end_index]["text"],
         tokenizer=tokenizer,
         batch_size=batch_size,
-        length=sequence_length,
         display_step=display_step,
         return_attention_mask=False,
         return_token_type_ids=False,
